@@ -4,11 +4,19 @@ from collections import deque
 from typing import Dict, Set, Tuple
 
 
-field_name = 'talhao'
-distancia_maxima_de_propagacao = 400
+max_propagation_distance = 400
+buffer_meters_for_intersecting_neighbor_plots = 30
 
-layer_name = 'talhao'
-layer = QgsProject.instance().mapLayersByName(layer_name)[0]
+layer = iface.activeLayer()
+
+if layer is None:
+    raise Exception('Nenhuma layer selecionada. Selecione uma camada no painel de Layers.')
+
+if layer.type() != layer.VectorLayer:
+    raise Exception('A camada selecionada não é vetorial. Selecione uma camada de polígonos.')
+
+if layer.geometryType() != QgsWkbTypes.PolygonGeometry:
+    raise Exception('A camada selecionada precisa ser do tipo Polígono ou MultiPolígono.')
 
 args = dict(
     INPUT=layer,
@@ -20,16 +28,11 @@ args = dict(
     OUTPUT='memory:'
 )
 
-layer_com_fid = processing.run('native:fieldcalculator', args)['OUTPUT']
-
-
-metros_de_buffer_para_interseccao_com_talhoes_vizinhos = 30
-
-talhoes_com_buffer = dict()
+layer_with_fid = processing.run('native:fieldcalculator', args)['OUTPUT']
 
 args = dict(
-    INPUT=layer_com_fid,
-    DISTANCE=metros_de_buffer_para_interseccao_com_talhoes_vizinhos,
+    INPUT=layer_with_fid,
+    DISTANCE=buffer_meters_for_intersecting_neighbor_plots,
     SEGMENTS=8,
     DISSOLVE=False,
     END_CAP_STYLE=0,
@@ -41,145 +44,150 @@ args = dict(
 buffer_layer = processing.run('native:buffer', args)['OUTPUT']
 
 buffer_features = list(buffer_layer.getFeatures())
-id_to_buffer_geom = {
-    f['fid_orig']: f.geometry()
-    for f in buffer_features
-}
-id_buffer_to_fid_orig = {f.id(): f['fid_orig'] for f in buffer_features}
+
+original_fid_to_buffer_geometry = {f['fid_orig']: f.geometry() for f in buffer_features}
+buffer_fid_to_original_fid = {f.id(): f['fid_orig'] for f in buffer_features}
 
 index = QgsSpatialIndex(buffer_layer.getFeatures())
 
-contatos = []
+overlapping_features = []
 
 for feature in buffer_features:
     feature_id = feature['fid_orig']
 
-    feature_com_buffer = id_to_buffer_geom[feature_id]
-    candidatos_a_vizinhos = index.intersects(feature_com_buffer.boundingBox())
+    feature_with_buffer = original_fid_to_buffer_geometry[feature_id]
+    candidate_neighbors = index.intersects(feature_with_buffer.boundingBox())
 
-    for candidato_id_buffer in candidatos_a_vizinhos:
-        candidato_a_vizinho = id_buffer_to_fid_orig[candidato_id_buffer]
+    for candidate_id in candidate_neighbors:
+        candidate = buffer_fid_to_original_fid[candidate_id]
 
-        if candidato_a_vizinho <= feature_id:
+        if candidate <= feature_id:
             continue
 
-        buffer_candidato_a_vizinho = id_to_buffer_geom[candidato_a_vizinho]
+        candidate_buffer = original_fid_to_buffer_geometry[candidate]
 
-        if not feature_com_buffer.boundingBox().intersects(buffer_candidato_a_vizinho.boundingBox()):
+        if not feature_with_buffer.boundingBox().intersects(candidate_buffer.boundingBox()):
             continue
 
-        interseccao_com_candidato_a_vizinho = feature_com_buffer.intersection(buffer_candidato_a_vizinho)
+        candidate_neighbors_intersection = feature_with_buffer.intersection(candidate_buffer)
 
-        if not interseccao_com_candidato_a_vizinho.isEmpty():
-            comprimento_de_interseccao_com_vizinho = interseccao_com_candidato_a_vizinho.length()
-            if comprimento_de_interseccao_com_vizinho > 0:
-                contatos.append(
+        if not candidate_neighbors_intersection.isEmpty():
+            neighbor_intersection_length = candidate_neighbors_intersection.length()
+
+            if neighbor_intersection_length > 0:
+                overlapping_features.append(
                     (
                         feature_id,
-                        candidato_a_vizinho,
-                        comprimento_de_interseccao_com_vizinho
+                        candidate,
+                        neighbor_intersection_length
                     )
                 )
 
-if not contatos:
+if not overlapping_features:
     raise Exception('Nenhum contato detectado dentro do buffer.')
 
-limites_em_metros_para_conexoes_aceitaveis = {}
+limits_in_meters_for_acceptable_connections = {}
 
-for feature_id in id_to_buffer_geom:
-   distancias_com_os_vizinhos = [
-      contato[2] for contato in contatos
-      if contato[0] == feature_id or contato[1] == feature_id
-   ]
+for feature_id in original_fid_to_buffer_geometry:
+    distances_with_neighbors = [
+        contact[2] for contact in overlapping_features
+        if contact[0] == feature_id or contact[1] == feature_id
+    ]
 
-   faixa_de_vizinhanca = np.percentile(distancias_com_os_vizinhos, 60) if distancias_com_os_vizinhos else 0
+    neighborhood_range = np.percentile(distances_with_neighbors, 60) if distances_with_neighbors else 0
 
+    limits_in_meters_for_acceptable_connections[feature_id] = neighborhood_range
 
-   limites_em_metros_para_conexoes_aceitaveis[feature_id] = faixa_de_vizinhanca 
+neighbors = {feature['fid_orig']: dict(allowed=[], not_allowed=[]) for feature in buffer_features}
 
-vizinhos = {feature['fid_orig']: dict(permitido=[], nao_permitido=[]) for feature in buffer_features}
-
-for feature_id, candidato_a_vizinho_id, comprimento in contatos:
-    limite_favoravel_para_conectar = np.mean(
+for feature_id, neighbor_candidate_id, length in overlapping_features:
+    favorable_limit_to_connect = np.mean(
         [
-            limites_em_metros_para_conexoes_aceitaveis[feature_id],
-            limites_em_metros_para_conexoes_aceitaveis[candidato_a_vizinho_id]
+            limits_in_meters_for_acceptable_connections[feature_id],
+            limits_in_meters_for_acceptable_connections[neighbor_candidate_id]
         ]
     )
 
-    deve_expandir_o_limite = (
-        limites_em_metros_para_conexoes_aceitaveis[feature_id] == 0 or
-        limites_em_metros_para_conexoes_aceitaveis[candidato_a_vizinho_id] == 0
+    should_expand_limit = (
+        limits_in_meters_for_acceptable_connections[feature_id] == 0 or
+        limits_in_meters_for_acceptable_connections[neighbor_candidate_id] == 0
     )
 
-    if deve_expandir_o_limite:
-        distancia_maxima_expandida = distancia_maxima_de_propagacao * 0.75
+    if should_expand_limit:
+        expanded_max_distance = max_propagation_distance * 0.75
 
-        limite_favoravel_para_conectar = min(distancia_maxima_de_propagacao, limite_favoravel_para_conectar + distancia_maxima_expandida)
+        favorable_limit_to_connect = min(
+            max_propagation_distance,
+            favorable_limit_to_connect + expanded_max_distance
+        )
 
-    limite_favoravel_para_conectar = min(limite_favoravel_para_conectar, distancia_maxima_de_propagacao)
+    favorable_limit_to_connect = min(favorable_limit_to_connect, max_propagation_distance)
 
-    chave = 'permitido' if comprimento <= limite_favoravel_para_conectar else 'nao_permitido'
+    key = 'allowed' if length <= favorable_limit_to_connect else 'not_allowed'
 
-    vizinhos[feature_id][chave].append((candidato_a_vizinho_id, comprimento))
-    vizinhos[candidato_a_vizinho_id][chave].append((feature_id, comprimento))
+    neighbors[feature_id][key].append((neighbor_candidate_id, length))
+    neighbors[neighbor_candidate_id][key].append((feature_id, length))
 
-vizinhos_permitidos = {feature_id: set(valor for valor, _ in relacionamentos['permitido']) for feature_id, relacionamentos in vizinhos.items()}
-vizinhos_nao_permitidos = {feature_id: set(valor for valor, _ in relacionamentos['nao_permitido']) for feature_id, relacionamentos in vizinhos.items()}
+allowed_neighbors = {feature_id: set(value for value, _ in relations['allowed']) for feature_id, relations in neighbors.items()}
+not_allowed_neighbors = {feature_id: set(value for value, _ in relations['not_allowed']) for feature_id, relations in neighbors.items()}
 
-conexoes = {feature_id: len(vizinhos_permitidos[feature_id]) for feature_id in vizinhos_permitidos}
+connections = {feature_id: len(allowed_neighbors[feature_id]) for feature_id in allowed_neighbors}
 
-feature_id_com_mais_conexoes = max(conexoes, key=conexoes.get)
+feature_id_with_most_connections = max(connections, key=connections.get)
 
-def propagar_rede_a_partir_de_feature(feature_id_inicial: int, vizinhos_permitidos: Dict[int, Set[int]], vizinhos_nao_permitidos: Dict[int, Set[int]]) -> Tuple[Set[int], Set[int]]:
-    # Um candidato é considerado em conflito se ele ou qualquer membro atual da rede
-    # estão listados como não permitidos entre si.
+def propagate_network_from_feature(initial_feature_id: int, allowed_neighbors: Dict[int, Set[int]], not_allowed_neighbors: Dict[int, Set[int]]) -> Tuple[Set[int], Set[int]]:
+    # A candidate is considered in conflict if they or any current member of the network
+    # are listed as not allowed between each other.
 
-    rede = {feature_id_inicial}
-    restricoes = set(vizinhos_nao_permitidos.get(feature_id_inicial, set()))
+    network = {initial_feature_id}
+    restrictions = set(not_allowed_neighbors.get(initial_feature_id, set()))
 
-    fila = deque([feature_id_inicial])
+    queue = deque([initial_feature_id])
 
-    while fila:
-        atual = fila.popleft()
+    while queue:
+        current = queue.popleft()
 
-        for candidato in vizinhos_permitidos[atual]:
+        for candidate in allowed_neighbors[current]:
 
-            if candidato in rede or candidato in restricoes:
+            if candidate in network or candidate in restrictions:
                 continue
 
-            restricoes_do_candidato = vizinhos_nao_permitidos.get(candidato, set())
+            candidate_restrictions = not_allowed_neighbors.get(candidate, set())
 
-            candidato_tem_restricoes_com_a_rede = any(no in restricoes_do_candidato for no in rede)
+            candidate_has_restrictions_with_network = any(node in candidate_restrictions for node in network)
 
-            if candidato_tem_restricoes_com_a_rede:
+            if candidate_has_restrictions_with_network:
                 continue
 
-            rede.add(candidato)
-            fila.append(candidato)
-            restricoes.update(restricoes_do_candidato)
+            network.add(candidate)
+            queue.append(candidate)
+            restrictions.update(candidate_restrictions)
 
-    return rede, restricoes
+    return network, restrictions
 
-rede, bloqueados = propagar_rede_a_partir_de_feature(feature_id_com_mais_conexoes, vizinhos_permitidos, vizinhos_nao_permitidos)
+network, blocked = propagate_network_from_feature(
+    feature_id_with_most_connections,
+    allowed_neighbors,
+    not_allowed_neighbors
+)
 
-candidatos = set(vizinhos.keys()) - rede - bloqueados
+candidates = set(neighbors.keys()) - network - blocked
 
-for feature_id in candidatos.copy():
-    if feature_id in bloqueados:
+for feature_id in candidates.copy():
+    if feature_id in blocked:
         continue
 
-    restricoes = vizinhos_nao_permitidos.get(feature_id, set())
-    conflito = any(no in restricoes for no in rede)
+    restrictions = not_allowed_neighbors.get(feature_id, set())
+    conflict = any(node in restrictions for node in network)
 
-    if conflito:
-        bloqueados.add(feature_id)
+    if conflict:
+        blocked.add(feature_id)
         continue
 
-    rede.add(feature_id)
+    network.add(feature_id)
 
-    candidatos.difference_update(restricoes)
-    bloqueados.update(restricoes)
+    candidates.difference_update(restrictions)
+    blocked.update(restrictions)
 
 layer.removeSelection()
-layer.select(list(rede))
+layer.select(list(network))

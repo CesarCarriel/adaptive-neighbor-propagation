@@ -4,14 +4,14 @@ from collections import deque
 from typing import Dict, Set, Tuple
 
 
-field_name = "talhao"
+field_name = 'talhao'
 distancia_maxima_de_propagacao = 400
 
 layer_name = 'talhao'
 layer = QgsProject.instance().mapLayersByName(layer_name)[0]
 
 args = dict(
-    INPUT=self.layer,
+    INPUT=layer,
     FIELD_NAME='fid_orig',
     FIELD_TYPE=1,
     FIELD_LENGTH=10,
@@ -22,7 +22,6 @@ args = dict(
 
 layer_com_fid = processing.run('native:fieldcalculator', args)['OUTPUT']
 
-# Mapeamentos
 
 metros_de_buffer_para_interseccao_com_talhoes_vizinhos = 30
 
